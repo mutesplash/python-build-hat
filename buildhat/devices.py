@@ -3,6 +3,7 @@
 import os
 import sys
 import weakref
+from concurrent.futures import Future
 
 from .exc import DeviceError
 from .serinterface import BuildHAT
@@ -57,17 +58,18 @@ class Device:
         Device._setup()
         self._simplemode = -1
         self._combimode = -1
+        self._modestr = ""
         self._typeid = self._conn.typeid
+        self._interval = 10
         if (
             self._typeid in Device._device_names
             and Device._device_names[self._typeid][0] != type(self).__name__  # noqa: W503
         ) or self._typeid == -1:
-            raise DeviceError('There is not a {} connected to port {} (Found {})'.format(type(self).__name__,
-                                                                                         port, self.name))
+            raise DeviceError(f'There is not a {type(self).__name__} connected to port {port} (Found {self.name})')
         Device._used[p] = True
 
     @staticmethod
-    def _setup(device="/dev/serial0"):
+    def _setup(**kwargs):
         if Device._instance:
             return
         data = os.path.join(os.path.dirname(sys.modules["buildhat"].__file__), "data/")
@@ -77,7 +79,7 @@ class Device:
         vfile = open(ver)
         v = int(vfile.read())
         vfile.close()
-        Device._instance = BuildHAT(firm, sig, v, device=device)
+        Device._instance = BuildHAT(firm, sig, v, **kwargs)
         weakref.finalize(Device._instance, Device._instance.shutdown)
 
     def __del__(self):
@@ -186,7 +188,7 @@ class Device:
 
     def reverse(self):
         """Reverse polarity"""
-        self._write("port {} ; plimit 1 ; set -1\r".format(self.port))
+        self._write(f"port {self.port} ; port_plimit 1 ; set -1\r")
 
     def get(self):
         """Extract information from device
@@ -195,18 +197,11 @@ class Device:
         :raises DeviceError: Occurs if device not in valid mode
         """
         self.isconnected()
-        idx = -1
-        if self._simplemode != -1:
-            idx = self._simplemode
-        elif self._combimode != -1:
-            idx = self._combimode
-        else:
+        if self._simplemode == -1 and self._combimode == -1:
             raise DeviceError("Not in simple or combimode")
-        self._write("port {} ; selonce {}\r".format(self.port, idx))
-        # wait for data
-        with Device._instance.portcond[self.port]:
-            Device._instance.portcond[self.port].wait()
-        return self._conn.data
+        ftr = Future()
+        self._hat.portftr[self.port].append(ftr)
+        return ftr.result()
 
     def mode(self, modev):
         """Set combimode or simple mode
@@ -215,18 +210,32 @@ class Device:
         """
         self.isconnected()
         if isinstance(modev, list):
-            self._combimode = 0
             modestr = ""
             for t in modev:
-                modestr += "{} {} ".format(t[0], t[1])
-            self._write("port {} ; combi {} {}\r".format(self.port, self._combimode, modestr))
+                modestr += f"{t[0]} {t[1]} "
+            if self._simplemode == -1 and self._combimode == 0 and self._modestr == modestr:
+                return
+            self._write(f"port {self.port}; select\r")
+            self._combimode = 0
+            self._write((f"port {self.port} ; combi {self._combimode} {modestr} ; "
+                         f"select {self._combimode} ; "
+                         f"selrate {self._interval}\r"))
             self._simplemode = -1
+            self._modestr = modestr
+            self._conn.combimode = 0
+            self._conn.simplemode = -1
         else:
+            if self._combimode == -1 and self._simplemode == int(modev):
+                return
             # Remove combi mode
             if self._combimode != -1:
-                self._write("port {} ; combi {}\r".format(self.port, self._combimode))
+                self._write(f"port {self.port} ; combi {self._combimode}\r")
+            self._write(f"port {self.port}; select\r")
             self._combimode = -1
             self._simplemode = int(modev)
+            self._write(f"port {self.port} ; select {int(modev)} ; selrate {self._interval}\r")
+            self._conn.combimode = -1
+            self._conn.simplemode = int(modev)
 
     def select(self):
         """Request data from mode
@@ -240,26 +249,27 @@ class Device:
             idx = self._combimode
         else:
             raise DeviceError("Not in simple or combimode")
-        self._write("port {} ; select {}\r".format(self.port, idx))
+        self._write(f"port {self.port} ; select {idx} ; selrate {self._interval}\r")
 
     def on(self):
         """Turn on sensor"""
-        self._write("port {} ; plimit 1 ; on\r".format(self.port))
+        self._write(f"port {self.port} ; port_plimit 1 ; on\r")
 
     def off(self):
         """Turn off sensor"""
-        self._write("port {} ; off\r".format(self.port))
+        self._write(f"port {self.port} ; off\r")
 
     def deselect(self):
         """Unselect data from mode"""
-        self._write("port {} ; select\r".format(self.port))
+        self._write(f"port {self.port} ; select\r")
 
     def _write(self, cmd):
         self.isconnected()
         Device._instance.write(cmd.encode())
 
     def _write1(self, data):
-        self._write("port {} ; write1 {}\r".format(self.port, ' '.join('{:x}'.format(h) for h in data)))
+        hexstr = ' '.join(f'{h:x}' for h in data)
+        self._write(f"port {self.port} ; write1 {hexstr}\r")
 
     def callback(self, func):
         """Set callback function
@@ -274,3 +284,28 @@ class Device:
             self._conn.callit = None
         else:
             self._conn.callit = weakref.WeakMethod(func)
+
+    @property
+    def interval(self):
+        """Interval between data points in milliseconds
+
+        :getter: Gets interval
+        :setter: Sets interval
+        :return: Device interval
+        :rtype: int
+        """
+        return self._interval
+
+    @interval.setter
+    def interval(self, value):
+        """Interval between data points in milliseconds
+
+        :param value: Interval
+        :type value: int
+        :raises DeviceError: Occurs if invalid interval passed
+        """
+        if isinstance(value, int) and value >= 0 and value <= 1000000000:
+            self._interval = value
+            self._write(f"port {self.port} ; selrate {self._interval}\r")
+        else:
+            raise DeviceError("Invalid interval")
